@@ -38,31 +38,31 @@ fn Sexpr(comptime Reader: type) type {
 
             const Next = union(enum) { Atom: []const u8, List: List };
 
-            pub fn next(self: List, buffer: []u8) !?Next {
+            pub fn next(self: List, allocator: *std.mem.Allocator) !?Next {
                 if (self.isAtEnd()) return null;
 
                 return switch (try self.ctx.scan()) {
                     .OpenParen => Next{ .List = .{ .ctx = self.ctx, .stack_level = self.ctx.current_stack } },
                     .CloseParen => null,
-                    .Atom => Next{ .Atom = try self.loadIntoBuffer(buffer) },
+                    .Atom => Next{ .Atom = try self.loadIntoAllocator(allocator) },
                 };
             }
 
-            pub fn obtainAtom(self: List, buffer: []u8) ![]u8 {
-                return (try self.nextAtom(buffer)) orelse error.ExpectedAtomGotNull;
+            pub fn obtainAtom(self: List, allocator: *std.mem.Allocator) ![]u8 {
+                return (try self.nextAtom(allocator)) orelse error.ExpectedAtomGotNull;
             }
 
             pub fn obtainList(self: List) !List {
                 return (try self.nextList()) orelse error.ExpectedListGotNull;
             }
 
-            pub fn nextAtom(self: List, buffer: []u8) !?[]u8 {
+            pub fn nextAtom(self: List, allocator: *std.mem.Allocator) !?[]u8 {
                 if (self.isAtEnd()) return null;
 
                 return switch (try self.ctx.scan()) {
                     .OpenParen => error.ExpectedAtomGotList,
                     .CloseParen => null,
-                    .Atom => try self.loadIntoBuffer(buffer),
+                    .Atom => try self.loadIntoAllocator(allocator),
                 };
             }
 
@@ -105,9 +105,9 @@ fn Sexpr(comptime Reader: type) type {
                 }
             }
 
-            fn loadIntoBuffer(self: List, buffer: []u8) ![]u8 {
-                var fbs = std.io.fixedBufferStream(buffer);
-                const writer = fbs.writer();
+            fn loadIntoAllocator(self: List, allocator: *std.mem.Allocator) ![]u8 {
+                var list = std.ArrayList(u8).init(allocator);
+                const writer = list.writer();
 
                 const first = try self.ctx.readByte();
                 try writer.writeByte(first);
@@ -120,13 +120,13 @@ fn Sexpr(comptime Reader: type) type {
 
                         // TODO: handle escape sequences?
                         if (byte == '"') {
-                            return fbs.getWritten();
+                            return list.toOwnedSlice();
                         }
                     } else {
                         switch (byte) {
                             0, ' ', '\t', '\n', '(', ')' => {
                                 self.ctx.putBack(byte);
-                                return fbs.getWritten();
+                                return list.toOwnedSlice();
                             },
                             else => try writer.writeByte(byte),
                         }
@@ -248,16 +248,17 @@ fn Sexpr(comptime Reader: type) type {
 }
 
 test "sexpr" {
+    var buf: [0x100]u8 = undefined;
+    var ring = util.RingAllocator.init(&buf);
     {
         var fbs = std.io.fixedBufferStream("(a bc 42)");
         var s = sexpr(fbs.reader());
 
         const root = try s.root();
 
-        var buf: [0x100]u8 = undefined;
-        std.testing.expectEqualSlices(u8, "a", try root.obtainAtom(&buf));
-        std.testing.expectEqualSlices(u8, "bc", try root.obtainAtom(&buf));
-        std.testing.expectEqualSlices(u8, "42", try root.obtainAtom(&buf));
+        std.testing.expectEqualSlices(u8, "a", try root.obtainAtom(&ring.allocator));
+        std.testing.expectEqualSlices(u8, "bc", try root.obtainAtom(&ring.allocator));
+        std.testing.expectEqualSlices(u8, "42", try root.obtainAtom(&ring.allocator));
         try root.expectEnd();
         try root.expectEnd();
         try root.expectEnd();
@@ -293,10 +294,9 @@ test "sexpr" {
 
         const root = try s.root();
 
-        var buf: [0x100]u8 = undefined;
-        std.testing.expectEqualSlices(u8, "block", try root.obtainAtom(&buf));
-        std.testing.expectEqualSlices(u8, "local.get", try root.obtainAtom(&buf));
-        std.testing.expectEqualSlices(u8, "4", try root.obtainAtom(&buf));
+        std.testing.expectEqualSlices(u8, "block", try root.obtainAtom(&ring.allocator));
+        std.testing.expectEqualSlices(u8, "local.get", try root.obtainAtom(&ring.allocator));
+        std.testing.expectEqualSlices(u8, "4", try root.obtainAtom(&ring.allocator));
         try root.expectEnd();
     }
 }
@@ -315,8 +315,10 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
 
     errdefer if (debug_buffer) ctx.debugDump(std.io.getStdOut().writer()) catch {};
 
-    var first_buf: [0x10]u8 = undefined;
-    if (!std.mem.eql(u8, try root.obtainAtom(&first_buf), "module")) {
+    var ring_buf: [0x1000]u8 = undefined;
+    var ring = util.RingAllocator.init(&ring_buf);
+
+    if (!std.mem.eql(u8, try root.obtainAtom(&ring.allocator), "module")) {
         return error.ExpectModule;
     }
 
@@ -339,14 +341,12 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
     while (try root.nextList()) |command| {
         const swhash = util.Swhash(8);
 
-        var cmdname_buf: [0x10]u8 = undefined;
-        switch (swhash.match(try command.obtainAtom(&cmdname_buf))) {
+        switch (swhash.match(try command.obtainAtom(&ring.allocator))) {
             swhash.case("memory") => {
-                var tmp_buf: [0x10]u8 = undefined;
                 try memories.append(.{
                     .limits = .{
-                        .initial = try std.fmt.parseInt(u32, try command.obtainAtom(&tmp_buf), 10),
-                        .maximum = if (try command.nextAtom(&tmp_buf)) |value|
+                        .initial = try std.fmt.parseInt(u32, try command.obtainAtom(&ring.allocator), 10),
+                        .maximum = if (try command.nextAtom(&ring.allocator)) |value|
                             try std.fmt.parseInt(u32, value, 10)
                         else
                             null,
@@ -357,18 +357,15 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
             },
             swhash.case("type") => {
                 while (try command.nextList()) |args| {
-                    var buf: [0x10]u8 = undefined;
-                    switch (swhash.match(try args.obtainAtom(&buf))) {
+                    switch (swhash.match(try args.obtainAtom(&ring.allocator))) {
                         swhash.case("func") => {
                             var params = std.ArrayList(Module.Type.Value).init(&arena.allocator);
                             var result: ?Module.Type.Value = null;
 
                             while (try args.nextList()) |pair| {
-                                var loc_buf: [0x10]u8 = undefined;
-                                const loc = try pair.obtainAtom(&loc_buf);
+                                const loc = try pair.obtainAtom(&ring.allocator);
 
-                                var typ_buf: [0x10]u8 = undefined;
-                                const typ: Module.Type.Value = switch (swhash.match(try pair.obtainAtom(&typ_buf))) {
+                                const typ: Module.Type.Value = switch (swhash.match(try pair.obtainAtom(&ring.allocator))) {
                                     swhash.case("i32") => .I32,
                                     swhash.case("i64") => .I64,
                                     swhash.case("f32") => .F32,
@@ -396,14 +393,12 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
                 }
             },
             swhash.case("import") => {
-                var module_buf: [0x1000]u8 = undefined;
-                const module = try command.obtainAtom(&module_buf);
+                const module = try command.obtainAtom(&ring.allocator);
                 if (module[0] != '"') {
                     return error.ExpectString;
                 }
 
-                var field_buf: [0x1000]u8 = undefined;
-                const field = try command.obtainAtom(&field_buf);
+                const field = try command.obtainAtom(&ring.allocator);
                 if (field[0] != '"') {
                     return error.ExpectString;
                 }
@@ -415,18 +410,15 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
                 };
 
                 const kind_list = try command.obtainList();
-                var import_type_buf: [0x100]u8 = undefined;
-                switch (swhash.match(try kind_list.obtainAtom(&import_type_buf))) {
+                switch (swhash.match(try kind_list.obtainAtom(&ring.allocator))) {
                     swhash.case("func") => {
                         const type_pair = try kind_list.obtainList();
 
-                        var name_buf: [0x100]u8 = undefined;
-                        if (!std.mem.eql(u8, "type", try type_pair.obtainAtom(&name_buf))) {
+                        if (!std.mem.eql(u8, "type", try type_pair.obtainAtom(&ring.allocator))) {
                             @panic("TODO inline function prototypes");
                         }
 
-                        var index_buf: [0x100]u8 = undefined;
-                        const index = try type_pair.obtainAtom(&index_buf);
+                        const index = try type_pair.obtainAtom(&ring.allocator);
                         try type_pair.expectEnd();
                         result.kind = .{
                             .Function = @intToEnum(Module.Index.FuncType, try std.fmt.parseInt(u32, index, 10)),
@@ -449,11 +441,9 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
                 var result: ?Module.Type.Value = null;
 
                 while (command.obtainList()) |pair| {
-                    var loc_buf: [0x10]u8 = undefined;
-                    const loc = try pair.obtainAtom(&loc_buf);
+                    const loc = try pair.obtainAtom(&ring.allocator);
 
-                    var typ_buf: [0x10]u8 = undefined;
-                    const typ: Module.Type.Value = switch (swhash.match(try pair.obtainAtom(&typ_buf))) {
+                    const typ: Module.Type.Value = switch (swhash.match(try pair.obtainAtom(&ring.allocator))) {
                         swhash.case("i32") => .I32,
                         swhash.case("i64") => .I64,
                         swhash.case("f32") => .F32,
@@ -475,8 +465,7 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
                 }
 
                 var body = std.ArrayList(Module.Instr).init(&arena.allocator);
-                var op_buf: [0x100]u8 = undefined;
-                while (try command.nextAtom(&op_buf)) |op_string| {
+                while (try command.nextAtom(&ring.allocator)) |op_string| {
                     for (op_string) |*letter| {
                         if (letter.* == '.') {
                             letter.* = '_';
@@ -495,13 +484,11 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
                                     error.ExpectedListGotAtom => break :blk Op.Arg{ .Type = .Void },
                                     else => |e| return e,
                                 };
-                                var buf: [0x10]u8 = undefined;
-                                if (!std.mem.eql(u8, try pair.obtainAtom(&buf), "result")) {
+                                if (!std.mem.eql(u8, try pair.obtainAtom(&ring.allocator), "result")) {
                                     return error.ExpectedResult;
                                 }
 
-                                var index_buf: [0x10]u8 = undefined;
-                                const typ: Op.Arg.Type = switch (swhash.match(try pair.obtainAtom(&index_buf))) {
+                                const typ: Op.Arg.Type = switch (swhash.match(try pair.obtainAtom(&ring.allocator))) {
                                     swhash.case("void") => .Void,
                                     swhash.case("i32") => .I32,
                                     swhash.case("i64") => .I64,
@@ -515,8 +502,7 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
                             },
                             .U32z, .Mem, .Array => @panic("TODO"),
                             else => blk: {
-                                var arg_buf: [0x10]u8 = undefined;
-                                const arg = try command.obtainAtom(&arg_buf);
+                                const arg = try command.obtainAtom(&ring.allocator);
                                 break :blk @as(Op.Arg, switch (op_meta.arg_kind) {
                                     .Void, .Type, .U32z, .Mem, .Array => unreachable,
                                     .I32 => .{ .I32 = try std.fmt.parseInt(i32, arg, 10) },
@@ -548,31 +534,27 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
             },
             swhash.case("global") => {
                 // 'skip' the id
-                var id_buf: [0x10]u8 = undefined;
-                const id = (try command.next(&id_buf)) orelse return error.ExpectedNext;
+                const id = (try command.next(&ring.allocator)) orelse return error.ExpectedNext;
 
-                var next_buf: [0x20]u8 = undefined;
                 const next = blk: {
                     // a comment was skipped so 'id' is the actual Atom/List we want
                     if (id != .Atom or id.Atom[0] != '$') break :blk id;
 
                     // if it was an id get next list/atom
-                    break :blk (try command.next(&next_buf)) orelse return error.ExpectedNext;
+                    break :blk (try command.next(&ring.allocator)) orelse return error.ExpectedNext;
                 };
 
                 const mutable = blk: {
                     if (next == .Atom) break :blk false;
 
-                    var mut_buf: [0x10]u8 = undefined;
-                    const mut = try next.List.obtainAtom(&mut_buf);
+                    const mut = try next.List.obtainAtom(&ring.allocator);
                     break :blk std.mem.eql(u8, mut, "mut");
                 };
 
                 const valtype = blk: {
                     const type_atom = switch (next) {
                         .List => |list| list_blk: {
-                            var type_buf: [0x10]u8 = undefined;
-                            const res = try list.obtainAtom(&type_buf);
+                            const res = try list.obtainAtom(&ring.allocator);
                             try list.expectEnd();
                             break :list_blk res;
                         },
@@ -588,8 +570,7 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
                 };
 
                 const init_pair = try command.obtainList();
-                var init_type_buf: [0x10]u8 = undefined;
-                var op_string = try init_pair.obtainAtom(&init_type_buf);
+                var op_string = try init_pair.obtainAtom(&ring.allocator);
                 for (op_string) |*letter| {
                     if (letter.* == '.') {
                         letter.* = '_';
@@ -598,8 +579,7 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
 
                 const op = std.meta.stringToEnum(std.wasm.Opcode, op_string) orelse return error.OpNotFound;
 
-                var val_buf: [0x10]u8 = undefined;
-                const value = try init_pair.obtainAtom(&val_buf);
+                const value = try init_pair.obtainAtom(&ring.allocator);
 
                 const result: Module.InitExpr = switch (op) {
                     .i32_const => .{ .i32_const = try std.fmt.parseInt(i32, value, 10) },
@@ -620,8 +600,7 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
                 });
             },
             swhash.case("export") => {
-                var export_name_buf: [0x100]u8 = undefined;
-                const export_name = try command.obtainAtom(&export_name_buf);
+                const export_name = try command.obtainAtom(&ring.allocator);
                 if (export_name[0] != '"') {
                     return error.ExpectString;
                 }
@@ -629,11 +608,8 @@ pub fn parseNoValidate(allocator: *std.mem.Allocator, reader: anytype) !Module {
 
                 const pair = try command.obtainList();
 
-                var kind_buf: [0x10]u8 = undefined;
-                const kind = try pair.obtainAtom(&kind_buf);
-
-                var index_buf: [0x10]u8 = undefined;
-                const index = try pair.obtainAtom(&index_buf);
+                const kind = try pair.obtainAtom(&ring.allocator);
+                const index = try pair.obtainAtom(&ring.allocator);
 
                 try exports.append(.{
                     .field = try arena.allocator.dupe(u8, export_name[1 .. export_name.len - 1]),
